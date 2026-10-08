@@ -1,0 +1,173 @@
+#!/usr/bin/env bash
+# claude shim: adds session management on top of the real claude CLI. Everything else is passed through.
+#
+#   claude rm [-y] [-n] <session>          delete a session (regular or background) and everything stored for it
+#   claude mv [-n] <session> <dir>         move a session so it resumes from <dir>
+#   claude search [options] PATTERN...     search transcripts (claude search -h)
+#   claude shim                            show shim version and which real claude it wraps
+#
+# <session> is a full session id, an id prefix (4+ chars), or a session name (/rename title or agent name).
+# Session ids are global, so these work from any directory.
+#   -y  don't ask for confirmation      -n  dry run: show what would happen, change nothing
+#
+# A session's files: ~/.claude/projects/<dir>/<id>.jsonl, ~/.claude/projects/<dir>/<id>/ (subagents,
+# tool results, title), ~/.claude/file-history/<id>/, ~/.claude/session-env/<id>/. The project's memory/
+# is shared by every session in that directory, so rm leaves it alone and mv doesn't carry it over.
+set -euo pipefail
+
+# Resolve our own location without readlink -f (not on older macOS).
+_self=${BASH_SOURCE[0]}
+while [ -L "$_self" ]; do
+  _d=$(cd -P "$(dirname "$_self")" && pwd); _self=$(readlink "$_self")
+  case "$_self" in /*) ;; *) _self=$_d/$_self ;; esac
+done
+SHIM_DIR=$(cd -P "$(dirname "$_self")" && pwd)
+LIBEXEC=$SHIM_DIR/../libexec
+# shellcheck source=../libexec/portable.sh
+. "$LIBEXEC/portable.sh"
+SELF=$(realpath_ "$SHIM_DIR/claude")
+CLAUDE_HOME=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+PROJECTS=$CLAUDE_HOME/projects
+
+# The real claude: first one on PATH that isn't this shim.
+real_claude() {
+  [ -n "${CLAUDE_SHIM_REAL:-}" ] && { echo "$CLAUDE_SHIM_REAL"; return; }
+  local p IFS=:
+  for p in $PATH; do
+    [ -x "$p/claude" ] && [ "$(realpath_ "$p/claude")" != "$SELF" ] && { echo "$p/claude"; return; }
+  done
+  echo "claude shim: can't find the real claude on PATH" >&2; exit 127
+}
+
+die() { echo "claude ${cmd:-}: $*" >&2; exit 1; }
+grep() { command grep "$@"; }   # bypass shell grep wrappers
+
+# How Claude Code names a project dir: every non-alphanumeric character becomes '-'.
+encode() { sed 's#[^A-Za-z0-9]#-#g' <<<"$1"; }
+
+# Print the transcript path for a session spec, or die (listing candidates if ambiguous).
+resolve() {
+  local q=$1 hits=()
+  shopt -s nullglob
+  if [[ $q =~ ^[0-9a-f-]{4,36}$ ]]; then
+    hits=("$PROJECTS"/*/"$q"*.jsonl)
+  fi
+  if [ ${#hits[@]} -eq 0 ]; then
+    local qj; qj=$(jq -Rr @json <<<"$q")
+    local h
+    while IFS= read -r h; do [ -n "$h" ] && hits+=("$h"); done \
+      < <(grep -lF -e "\"customTitle\":$qj" -e "\"agentName\":$qj" "$PROJECTS"/*/*.jsonl 2>/dev/null || true)
+    if [ ${#hits[@]} -eq 0 ]; then   # names only in the live registry (auto-derived ones)
+      local sid
+      sid=$(jq -r --arg n "$q" 'select(.name == $n) | .sessionId' "$CLAUDE_HOME"/sessions/*.json 2>/dev/null | head -1)
+      [ -n "$sid" ] && hits=("$PROJECTS"/*/"$sid".jsonl)
+    fi
+  fi
+  shopt -u nullglob
+  [ ${#hits[@]} -gt 0 ] || die "no session matches '$q'"
+  if [ ${#hits[@]} -gt 1 ]; then
+    echo "claude $cmd: '$q' matches ${#hits[@]} sessions:" >&2
+    for h in "${hits[@]}"; do echo "  $(basename "$h" .jsonl)  $(title_of "$h")  $(dirname "$h")" >&2; done
+    exit 1
+  fi
+  echo "${hits[0]}"
+}
+
+title_of() {
+  local t
+  t=$(grep -h '"type":"custom-title"' "$1" 2>/dev/null | tail -1 | jq -r '.customTitle // empty' 2>/dev/null) || true
+  [ -n "$t" ] || t=$(grep -h -m1 '"type":"ai-title"' "$1" 2>/dev/null | jq -r '.aiTitle // empty' 2>/dev/null) || true
+  echo "${t:-(untitled)}"
+}
+
+first_prompt() {
+  grep -m1 '"type":"user"' "$1" | jq -r '.message.content | if type=="string" then . else (map(select(.type=="text").text) | join(" ")) end' 2>/dev/null \
+    | tr '\n\t' '  ' | cut -c1-100
+}
+
+# "<kind> <pid>" if the session has a live process, else empty.
+live() {
+  local sid=$1 f pid kind
+  for f in "$CLAUDE_HOME"/sessions/*.json; do
+    [ -e "$f" ] || continue
+    [ "$(jq -r .sessionId "$f" 2>/dev/null)" = "$sid" ] || continue
+    pid=$(jq -r .pid "$f"); kind=$(jq -r .kind "$f")
+    kill -0 "$pid" 2>/dev/null && { echo "$kind $pid"; return; }
+  done
+}
+
+is_background() {
+  "$REAL" agents --json --all 2>/dev/null | jq -e --arg s "$1" 'any(.[]; .sessionId == $s and .kind == "background")' >/dev/null
+}
+
+describe() {  # <transcript>
+  local f=$1 sid; sid=$(basename "$f" .jsonl)
+  echo "  session: $sid  \"$(title_of "$f")\""
+  echo "  dir:     $(grep -m1 -o '"cwd":"[^"]*"' "$f" | sed 's/^"cwd":"//;s/"$//')"
+  echo "  last:    $(fmt_epoch "$(mtime "$f")" '%Y-%m-%d %H:%M')"
+  echo "  first:   $(first_prompt "$f")"
+}
+
+session_paths() {  # <transcript> -> every path belonging to the session that exists
+  local f=$1 sid p; sid=$(basename "$f" .jsonl)
+  for p in "$f" "${f%.jsonl}" "$CLAUDE_HOME/file-history/$sid" "$CLAUDE_HOME/session-env/$sid"; do
+    [ -e "$p" ] && echo "$p"
+  done
+  return 0
+}
+
+cmd_rm() {
+  local yes=0 dry=0
+  while [ $# -gt 0 ]; do case "$1" in -y|--yes) yes=1 ;; -n|--dry-run) dry=1 ;; -h|--help) sed -n '2,16p' "$SHIM_DIR/claude"; exit 0 ;; *) break ;; esac; shift; done
+  [ $# -eq 1 ] || die "usage: claude rm [-y] [-n] <session>"
+  local f sid l bg=0
+  f=$(resolve "$1"); sid=$(basename "$f" .jsonl)
+  l=$(live "$sid")
+  is_background "$sid" && bg=1
+  [ -n "$l" ] && [ $bg = 0 ] && die "session $sid is open (${l% *} pid ${l#* }); close it first"
+
+  echo "Delete:"; describe "$f"
+  [ $bg = 1 ] && echo "  background session: claude's own rm runs first (stops it, removes its worktree when safe)"
+  session_paths "$f" | sed 's/^/  rm -r /'
+  [ $dry = 1 ] && { echo "(dry run, nothing deleted)"; return; }
+  if [ $yes = 0 ]; then read -rp "Delete this session? [y/N] " a; [[ $a == [yY]* ]] || die "cancelled"; fi
+
+  [ $bg = 1 ] && "$REAL" rm "${sid:0:8}"
+  session_paths "$f" | while read -r p; do rm -rf -- "$p"; done
+  echo "Deleted $sid"
+}
+
+cmd_mv() {
+  local dry=0
+  while [ $# -gt 0 ]; do case "$1" in -n|--dry-run) dry=1 ;; -h|--help) sed -n '2,16p' "$SHIM_DIR/claude"; exit 0 ;; *) break ;; esac; shift; done
+  [ $# -eq 2 ] || die "usage: claude mv [-n] <session> <dir>"
+  local f sid dest ddir
+  f=$(resolve "$1"); sid=$(basename "$f" .jsonl)
+  dest=$(cd "$2" 2>/dev/null && pwd -P) || die "no such directory: $2"
+  [ -z "$(live "$sid")" ] || die "session $sid is running; close or stop it first"
+  is_background "$sid" && die "session $sid is a background session; claude tracks those by directory, so mv only handles regular sessions"
+  ddir=$PROJECTS/$(encode "$dest")
+  [ "$ddir" != "$(dirname "$f")" ] || die "already in $dest"
+  [ ! -e "$ddir/$sid.jsonl" ] && [ ! -e "$ddir/$sid" ] || die "$ddir already has files for $sid"
+
+  echo "Move to $dest:"; describe "$f"
+  echo "  $f -> $ddir/"
+  [ -d "${f%.jsonl}" ] && echo "  ${f%.jsonl}/ -> $ddir/"
+  [ $dry = 1 ] && { echo "(dry run, nothing moved)"; return; }
+
+  mkdir -p "$ddir"
+  mv -- "$f" "$ddir/"
+  [ -d "${f%.jsonl}" ] && mv -- "${f%.jsonl}" "$ddir/"
+  rmdir --ignore-fail-on-non-empty "$(dirname "$f")" 2>/dev/null || true
+  echo "Moved. Resume with: cd $dest && claude --resume $sid"
+}
+
+cmd=${1:-}
+REAL=$(real_claude)
+case "$cmd" in
+  rm)     shift; cmd_rm "$@" ;;
+  mv)     shift; cmd_mv "$@" ;;
+  search) shift; exec "$LIBEXEC/claude-search" "$@" ;;
+  shim)   echo "claude shim $(cat "$SHIM_DIR/../VERSION" 2>/dev/null || echo dev) at $SHIM_DIR; real claude: $REAL" ;;
+  *)      exec "$REAL" "$@" ;;
+esac

@@ -1,0 +1,20 @@
+name: ci
+on: [push, pull_request]
+jobs:
+  test:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install deps (macOS)
+        if: runner.os == 'macOS'
+        run: brew install bash jq shellcheck
+      - name: Install deps (Linux)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y jq shellcheck
+      - name: shellcheck
+        run: shellcheck -x -S warning bin/claude libexec/claude-search libexec/portable.sh install.sh uninstall.sh tests/run.sh
+      - name: tests
+        run: bash tests/run.sh
