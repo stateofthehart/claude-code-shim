@@ -1,3 +1,4 @@
+# shellcheck shell=bash
 # Helpers that behave the same on GNU (Linux) and BSD (macOS) userlands. Sourced, not executed.
 
 # Absolute path with symlinks resolved (readlink -f isn't on older macOS).

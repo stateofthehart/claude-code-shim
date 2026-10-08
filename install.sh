@@ -19,7 +19,7 @@ rc=1
 
 while [ $# -gt 0 ]; do
   case "$1" in
-    --link) mode=link ;;
+    --link) mode="link" ;;
     --prefix) prefix=$2; shift ;;
     --no-rc) rc=0 ;;
     -h|--help) sed -n '2,12p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;

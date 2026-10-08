@@ -126,6 +126,7 @@ gflags=(-E -l)
 # Collect candidate session files
 shopt -s nullglob
 if [[ -n "$dir_glob" ]]; then
+  # shellcheck disable=SC2206  # dir_glob is an intentional glob (-D, ls -r)
   files=("$PROJECTS_DIR"/$dir_glob/*.jsonl)
 else
   files=("$PROJECTS_DIR"/*/*.jsonl)
@@ -154,7 +155,7 @@ else
   current=$(grep "${gflags[@]}" -- "${patterns[0]}" "${files[@]}" 2>/dev/null || true)
   for ((i=1; i<${#patterns[@]}; i++)); do
     [[ -z "$current" ]] && break
-    current=$(printf '%s\n' "$current" | tr '\n' '\0' | xargs -0 grep "${gflags[@]}" -- "${patterns[$i]}" 2>/dev/null || true)
+    current=$(printf '%s\n' "$current" | tr '\n' '\0' | xargs -0 command grep "${gflags[@]}" -- "${patterns[$i]}" 2>/dev/null || true)
   done
   while IFS= read -r f; do [[ -n "$f" ]] && matched+=("$f"); done <<< "$current"
 fi
@@ -284,7 +285,7 @@ fi
 # Pretty print
 while IFS="$RS" read -r _epoch mtime cwd sess title name status first lastp lastr snips; do
   [[ -z "$mtime" ]] && continue
-  st=""; [[ -n "$status" ]] && st="  $C_LIVE[$status]$C_OFF"
+  st=""; [[ -n "$status" ]] && st="  ${C_LIVE}[${status}]${C_OFF}"
   printf '%s%s%s  %s%s%s%s\n' "$C_TIME" "$mtime" "$C_OFF" "$C_DIR" "$cwd" "$C_OFF" "$st"
   [[ -n "$title" ]]                          && printf '  %stitle:%s   %s%s%s\n'   "$C_LBL" "$C_OFF" "$C_TITLE" "$title" "$C_OFF"
   [[ -n "$name" ]]                           && printf '  %sname:%s    %s\n'        "$C_LBL" "$C_OFF" "$name"
