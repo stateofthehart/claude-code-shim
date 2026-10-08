@@ -3,6 +3,7 @@
 #
 #   claude rm [-y] [-n] <session>          delete a session (regular or background) and everything stored for it
 #   claude mv [-n] <session> <dir>         move a session so it resumes from <dir>
+#   claude ls [-r] [options] [DIR]         list sessions started in DIR (default .), -r includes subdirs
 #   claude search [options] PATTERN...     search transcripts (claude search -h)
 #   claude shim                            show shim version and which real claude it wraps
 #
@@ -100,10 +101,20 @@ is_background() {
   "$REAL" agents --json --all 2>/dev/null | jq -e --arg s "$1" 'any(.[]; .sessionId == $s and .kind == "background")' >/dev/null
 }
 
+# The directory a session resumes from: the recorded cwd whose encoding matches its project dir.
+home_dir() {
+  local f=$1 pdir c
+  pdir=$(basename "$(dirname "$f")")
+  while IFS= read -r c; do
+    [ "$(encode "$c")" = "$pdir" ] && { echo "$c"; return; }
+  done < <(grep -o '"cwd":"[^"]*"' "$f" | sed 's/^"cwd":"//;s/"$//' | awk '!seen[$0]++')
+  grep -m1 -o '"cwd":"[^"]*"' "$f" | sed 's/^"cwd":"//;s/"$//'
+}
+
 describe() {  # <transcript>
   local f=$1 sid; sid=$(basename "$f" .jsonl)
   echo "  session: $sid  \"$(title_of "$f")\""
-  echo "  dir:     $(grep -m1 -o '"cwd":"[^"]*"' "$f" | sed 's/^"cwd":"//;s/"$//')"
+  echo "  dir:     $(home_dir "$f")"
   echo "  last:    $(fmt_epoch "$(mtime "$f")" '%Y-%m-%d %H:%M')"
   echo "  first:   $(first_prompt "$f")"
 }
@@ -118,7 +129,7 @@ session_paths() {  # <transcript> -> every path belonging to the session that ex
 
 cmd_rm() {
   local yes=0 dry=0
-  while [ $# -gt 0 ]; do case "$1" in -y|--yes) yes=1 ;; -n|--dry-run) dry=1 ;; -h|--help) sed -n '2,16p' "$SHIM_DIR/claude"; exit 0 ;; *) break ;; esac; shift; done
+  while [ $# -gt 0 ]; do case "$1" in -y|--yes) yes=1 ;; -n|--dry-run) dry=1 ;; -h|--help) sed -n '2,17p' "$SHIM_DIR/claude"; exit 0 ;; *) break ;; esac; shift; done
   [ $# -eq 1 ] || die "usage: claude rm [-y] [-n] <session>"
   local f sid l bg=0
   f=$(resolve "$1"); sid=$(basename "$f" .jsonl)
@@ -139,7 +150,7 @@ cmd_rm() {
 
 cmd_mv() {
   local dry=0
-  while [ $# -gt 0 ]; do case "$1" in -n|--dry-run) dry=1 ;; -h|--help) sed -n '2,16p' "$SHIM_DIR/claude"; exit 0 ;; *) break ;; esac; shift; done
+  while [ $# -gt 0 ]; do case "$1" in -n|--dry-run) dry=1 ;; -h|--help) sed -n '2,17p' "$SHIM_DIR/claude"; exit 0 ;; *) break ;; esac; shift; done
   [ $# -eq 2 ] || die "usage: claude mv [-n] <session> <dir>"
   local f sid dest ddir
   f=$(resolve "$1"); sid=$(basename "$f" .jsonl)
@@ -168,6 +179,7 @@ case "$cmd" in
   rm)     shift; cmd_rm "$@" ;;
   mv)     shift; cmd_mv "$@" ;;
   search) shift; exec "$LIBEXEC/claude-search" "$@" ;;
+  ls)     shift; exec "$LIBEXEC/claude-search" --list "$@" ;;
   shim)   echo "claude shim $(cat "$SHIM_DIR/../VERSION" 2>/dev/null || echo dev) at $SHIM_DIR; real claude: $REAL" ;;
   *)      exec "$REAL" "$@" ;;
 esac

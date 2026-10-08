@@ -1,7 +1,14 @@
 #!/usr/bin/env bash
-# claude search - search Claude Code session transcripts for patterns
+# claude search / claude ls - search or list Claude Code sessions
 #
 # Usage: claude search [options] PATTERN [PATTERN ...]
+#        claude ls [options] [DIR]      list sessions started in DIR (default: current dir)
+#
+# ls options:
+#   -r, --recursive   Also include sessions started in subdirectories of DIR
+#   plus -p, -L, -l, -w, --no-color below
+#
+# search options:
 #   -o, --or          OR mode: match any pattern (default: AND, all must match)
 #   -i, --ignore-case Case-insensitive matching
 #   -p, --preview     Show first user prompt
@@ -19,6 +26,7 @@
 #
 # Patterns are extended regex (grep -E). Matches the raw JSONL transcript text.
 # Each result shows the session id; pass it to claude --resume, claude rm or claude mv.
+# Status: running (open now), background, or nothing (closed). Newest first.
 
 set -euo pipefail
 
@@ -44,9 +52,13 @@ limit=0
 width=160
 dir_glob=""
 color_opt=auto
+list=0
+recursive=0
 
 while [[ $# -gt 0 ]]; do
   case "$1" in
+    --list) list=1; shift ;;
+    -r|--recursive) recursive=1; shift ;;
     -o|--or) mode=or; shift ;;
     -i|--ignore-case) ignore=1; shift ;;
     -p|--preview) preview=1; shift ;;
@@ -62,7 +74,7 @@ while [[ $# -gt 0 ]]; do
     --no-color) color_opt=never; shift ;;
     --color) color_opt=always; shift ;;
     -h|--help)
-      sed -n '2,22p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+      sed -n '2,31p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
       exit 0
       ;;
     --) shift; break ;;
@@ -71,7 +83,13 @@ while [[ $# -gt 0 ]]; do
   esac
 done
 
-if [[ $# -lt 1 ]]; then
+if [[ $list -eq 1 ]]; then
+  [[ $# -le 1 ]] || { echo "usage: claude ls [options] [DIR]" >&2; exit 2; }
+  list_dir=$(cd "${1:-.}" 2>/dev/null && pwd -P) || { echo "no such directory: ${1:-.}" >&2; exit 2; }
+  dir_glob=$(sed 's#[^A-Za-z0-9]#-#g' <<<"$list_dir")
+  [[ $recursive -eq 1 ]] && dir_glob="$dir_glob*"
+  set --
+elif [[ $# -lt 1 ]]; then
   echo "error: need at least one pattern (try -h)" >&2
   exit 2
 fi
@@ -91,12 +109,13 @@ if [[ $use_color -eq 1 ]]; then
   C_TITLE=$'\e[1;33m'   # bold yellow
   C_DIM=$'\e[2m'        # dim
   C_MATCH_LBL=$'\e[1;35m' # bold magenta
+  C_LIVE=$'\e[1;32m'    # bold green
   C_OFF=$'\e[0m'
   GREP_COLOR=always
   # Make grep's match highlight stand out (red bg, bold)
   export GREP_COLORS='mt=1;41'
 else
-  C_TIME=""; C_DIR=""; C_LBL=""; C_TITLE=""; C_DIM=""; C_MATCH_LBL=""; C_OFF=""
+  C_TIME=""; C_DIR=""; C_LBL=""; C_TITLE=""; C_DIM=""; C_MATCH_LBL=""; C_LIVE=""; C_OFF=""
   GREP_COLOR=never
 fi
 
@@ -114,13 +133,20 @@ fi
 shopt -u nullglob
 
 if [[ ${#files[@]} -eq 0 ]]; then
-  echo "no session files found under $PROJECTS_DIR" >&2
+  if [[ $list -eq 1 ]]; then
+    echo "no sessions started in $list_dir${recursive:+$([[ $recursive -eq 1 ]] && echo ' or below')}" >&2
+    [[ $recursive -eq 0 ]] && echo "(sessions in subdirectories: claude ls -r ${1:-$list_dir})" >&2
+  else
+    echo "no session files found under $PROJECTS_DIR" >&2
+  fi
   exit 1
 fi
 
 # Filter files by patterns (against raw JSONL)
 matched=()
-if [[ $mode == or ]]; then
+if [[ $list -eq 1 ]]; then
+  matched=("${files[@]}")
+elif [[ $mode == or ]]; then
   joined=$(printf '%s|' "${patterns[@]}")
   joined="${joined%|}"
   while IFS= read -r f; do matched+=("$f"); done < <(grep "${gflags[@]}" -- "$joined" "${files[@]}" 2>/dev/null || true)
@@ -137,6 +163,19 @@ if [[ ${#matched[@]} -eq 0 ]]; then
   echo "no matches" >&2
   exit 1
 fi
+
+# sessionId -> "name<TAB>status" from the live registry (sessions/*.json), once.
+CLAUDE_HOME=${CLAUDE_CONFIG_DIR:-$HOME/.claude}
+declare -A reg_name=() reg_status=()
+for rf in "$CLAUDE_HOME"/sessions/*.json; do
+  [[ -e "$rf" ]] || continue
+  IFS=$'\t' read -r r_sid r_pid r_kind r_name < <(jq -r '[.sessionId, .pid, .kind, (.name // "")] | @tsv' "$rf" 2>/dev/null) || continue
+  [[ -n "$r_sid" ]] || continue
+  reg_name[$r_sid]=$r_name
+  if kill -0 "$r_pid" 2>/dev/null; then
+    [[ $r_kind == bg || $r_kind == background ]] && reg_status[$r_sid]="background" || reg_status[$r_sid]="running"
+  fi
+done
 
 trunc() { tr '\n\t' '  ' | tr -s ' ' | cut -c1-"$width" | sed 's/[[:space:]]*$//'; }
 sanitize_tabs() { tr '\t' ' '; }
@@ -160,13 +199,27 @@ rows=$(
   for f in "${matched[@]}"; do
     mtime_epoch=$(mtime "$f")
     mtime_iso=$(fmt_epoch "$mtime_epoch" '%Y-%m-%d %H:%M:%S')
-    cwd=$(grep -m1 -o '"cwd":"[^"]*"' "$f" | head -1 | sed 's/^"cwd":"//;s/"$//')
+    # Show where the session resumes from: the cwd whose encoding matches its project dir
+    # (later cwds can be subdirectories it cd'd into; earlier ones a dir it was moved from).
+    pdir=$(basename "$(dirname "$f")")
+    cwd=""
+    while IFS= read -r c; do
+      [[ $(sed 's#[^A-Za-z0-9]#-#g' <<<"$c") == "$pdir" ]] && { cwd=$c; break; }
+    done < <(grep -o '"cwd":"[^"]*"' "$f" | sed 's/^"cwd":"//;s/"$//' | awk '!seen[$0]++')
+    [[ -z "$cwd" ]] && cwd=$(grep -m1 -o '"cwd":"[^"]*"' "$f" | sed 's/^"cwd":"//;s/"$//')
     [[ -z "$cwd" ]] && cwd="(unknown)"
 
     title=$(grep '"type":"custom-title"' "$f" 2>/dev/null | tail -1 \
       | jq -r '.customTitle // ""' 2>/dev/null | sanitize_tabs || true)
     [[ -z "$title" ]] && title=$(grep -m1 '"type":"ai-title"' "$f" 2>/dev/null \
       | jq -r '.aiTitle // ""' 2>/dev/null | sanitize_tabs || true)
+
+    sid=$(basename "$f" .jsonl)
+    name=$(grep '"type":"agent-name"' "$f" 2>/dev/null | tail -1 \
+      | jq -r '.agentName // ""' 2>/dev/null | sanitize_tabs || true)
+    [[ -z "$name" ]] && name=${reg_name[$sid]:-}
+    [[ "$name" == "$title" ]] && name=""
+    status=${reg_status[$sid]:-}
 
     first=""
     if [[ $preview -eq 1 ]]; then
@@ -218,9 +271,9 @@ rows=$(
       rm -f "$text_file"
     fi
 
-    printf '%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n' \
+    printf '%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s%s\n' \
       "$mtime_epoch" "$RS" "$mtime_iso" "$RS" "$cwd" "$RS" "$f" "$RS" \
-      "$title" "$RS" "$first" "$RS" "$last_prompt" "$RS" "$last_reply" "$RS" "$snip_field"
+      "$title" "$RS" "$name" "$RS" "$status" "$RS" "$first" "$RS" "$last_prompt" "$RS" "$last_reply" "$RS" "$snip_field"
   done | sort -t "$RS" -k1,1nr
 )
 
@@ -229,10 +282,12 @@ if [[ $limit -gt 0 ]]; then
 fi
 
 # Pretty print
-while IFS="$RS" read -r _epoch mtime cwd sess title first lastp lastr snips; do
+while IFS="$RS" read -r _epoch mtime cwd sess title name status first lastp lastr snips; do
   [[ -z "$mtime" ]] && continue
-  printf '%s%s%s  %s%s%s\n' "$C_TIME" "$mtime" "$C_OFF" "$C_DIR" "$cwd" "$C_OFF"
+  st=""; [[ -n "$status" ]] && st="  $C_LIVE[$status]$C_OFF"
+  printf '%s%s%s  %s%s%s%s\n' "$C_TIME" "$mtime" "$C_OFF" "$C_DIR" "$cwd" "$C_OFF" "$st"
   [[ -n "$title" ]]                          && printf '  %stitle:%s   %s%s%s\n'   "$C_LBL" "$C_OFF" "$C_TITLE" "$title" "$C_OFF"
+  [[ -n "$name" ]]                           && printf '  %sname:%s    %s\n'        "$C_LBL" "$C_OFF" "$name"
   printf '  %ssession:%s %s%s%s\n' "$C_LBL" "$C_OFF" "$C_DIM" "$(basename "$sess" .jsonl)" "$C_OFF"
   [[ $preview -eq 1   && -n "$first" ]]      && printf '  %sfirst:%s   %s\n'        "$C_LBL" "$C_OFF" "$first"
   [[ $show_last -eq 1 && -n "$lastp" ]]      && printf '  %slast >:%s  %s\n'        "$C_LBL" "$C_OFF" "$lastp"

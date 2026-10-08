@@ -7,7 +7,7 @@
 #   ./install.sh --no-rc         don't touch shell rc files; print the PATH line instead
 #
 # One-liner on a new machine:
-#   git clone https://github.com/stateofthehart/claude-shim ~/.local/src/claude-shim && ~/.local/src/claude-shim/install.sh
+#   git clone https://github.com/stateofthehart/claude-code-shim ~/.local/src/claude-code-shim && ~/.local/src/claude-code-shim/install.sh
 #
 # Re-running is safe: files are replaced and the rc block is rewritten in place.
 set -euo pipefail

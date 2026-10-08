@@ -2,6 +2,7 @@
 # Self-contained tests: a fake CLAUDE_CONFIG_DIR and a stub "real" claude. Never touches ~/.claude.
 #   tests/run.sh
 set -uo pipefail
+[ -n "${TRACE:-}" ] && set -x
 
 root=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 t=$(mktemp -d "${TMPDIR:-/tmp}/claude-shim-test.XXXXXX")
@@ -58,6 +59,21 @@ out=$(cd "$HOME/work/a_b" && claude search --no-color -d . kiwi 2>&1)
 if grep -q "session: $A" <<<"$out" && grep -q "title:   alpha session" <<<"$out" && ! grep -q $B <<<"$out"; then ok "search -d . by pattern"; else bad "search -d . by pattern" "$out"; fi
 out=$(claude search --no-color -o kiwi mango 2>&1)
 if grep -q $A <<<"$out" && grep -q $B <<<"$out"; then ok "search OR mode"; else bad "search OR mode" "$out"; fi
+
+# ls: current dir, explicit dir, recursive, status and name
+mkdir -p "$HOME/work/a_b/sub"
+D=dddddddd-1111-2222-3333-444444444444
+make_session $D "$HOME/work/a_b/sub" "deeper" "guava"
+printf '{"type":"agent-name","agentName":"lane-dev","sessionId":"%s"}\n' $B >> "$pdir/$B.jsonl"
+sleep 300 & ls_pid=$!
+printf '{"pid":%s,"sessionId":"%s","kind":"bg","name":"x"}\n' $ls_pid $B > "$CLAUDE_CONFIG_DIR/sessions/$ls_pid.json"
+out=$(cd "$HOME/work/a_b" && claude ls --no-color 2>&1)
+if grep -q "session: $A" <<<"$out" && grep -q "session: $B" <<<"$out" && ! grep -q $D <<<"$out"; then ok "ls lists current dir only"; else bad "ls lists current dir only" "$out"; fi
+if grep -q "name:    lane-dev" <<<"$out" && grep -q "\[background\]" <<<"$out"; then ok "ls shows name and background status"; else bad "ls shows name and background status" "$out"; fi
+out=$(claude ls --no-color -r "$HOME/work" 2>&1)
+if grep -q $D <<<"$out" && grep -q $A <<<"$out"; then ok "ls -r includes subdirs"; else bad "ls -r includes subdirs" "$out"; fi
+out=$(claude ls --no-color "$HOME/work" 2>&1); check "ls hints -r when dir has none" grep -q "claude ls -r" <<<"$out"
+kill $ls_pid 2>/dev/null; wait $ls_pid 2>/dev/null; rm -f "$CLAUDE_CONFIG_DIR/sessions/$ls_pid.json"
 
 # rm: dry run, by name
 out=$(claude rm -n "beta" 2>&1)
