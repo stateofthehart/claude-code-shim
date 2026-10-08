@@ -154,7 +154,7 @@ cmd_mv() {
   [ $# -eq 2 ] || die "usage: claude mv [-n] <session> <dir>"
   local f sid dest ddir
   f=$(resolve "$1"); sid=$(basename "$f" .jsonl)
-  dest=$(cd "$2" 2>/dev/null && pwd -P) || die "no such directory: $2"
+  dest=$(cd "$2" 2>/dev/null && pwd) || die "no such directory: $2"
   [ -z "$(live "$sid")" ] || die "session $sid is running; close or stop it first"
   is_background "$sid" && die "session $sid is a background session; claude tracks those by directory, so mv only handles regular sessions"
   ddir=$PROJECTS/$(encode "$dest")

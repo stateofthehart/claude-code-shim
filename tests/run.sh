@@ -6,6 +6,7 @@ set -uo pipefail
 
 root=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 t=$(mktemp -d "${TMPDIR:-/tmp}/claude-shim-test.XXXXXX")
+t=$(cd "$t" && pwd)   # collapse "//" (macOS TMPDIR ends in /)
 trap 'rm -rf "$t"' EXIT
 
 export CLAUDE_CONFIG_DIR=$t/claude

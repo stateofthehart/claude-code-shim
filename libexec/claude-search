@@ -69,7 +69,7 @@ while [[ $# -gt 0 ]]; do
     -c|--context) context="$2"; shift 2 ;;
     -w|--width) width="$2"; shift 2 ;;
     -l|--limit) limit="$2"; shift 2 ;;
-    -d|--dir) dir_glob=$(cd "$2" && pwd -P | sed 's#[^A-Za-z0-9]#-#g') || exit 2; shift 2 ;;
+    -d|--dir) dir_glob=$(cd "$2" && pwd | sed 's#[^A-Za-z0-9]#-#g') || exit 2; shift 2 ;;
     -D) dir_glob="$2"; shift 2 ;;
     --no-color) color_opt=never; shift ;;
     --color) color_opt=always; shift ;;
@@ -85,7 +85,7 @@ done
 
 if [[ $list -eq 1 ]]; then
   [[ $# -le 1 ]] || { echo "usage: claude ls [options] [DIR]" >&2; exit 2; }
-  list_dir=$(cd "${1:-.}" 2>/dev/null && pwd -P) || { echo "no such directory: ${1:-.}" >&2; exit 2; }
+  list_dir=$(cd "${1:-.}" 2>/dev/null && pwd) || { echo "no such directory: ${1:-.}" >&2; exit 2; }
   dir_glob=$(sed 's#[^A-Za-z0-9]#-#g' <<<"$list_dir")
   [[ $recursive -eq 1 ]] && dir_glob="$dir_glob*"
   set --
