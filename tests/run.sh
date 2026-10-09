@@ -2,6 +2,7 @@
 # Self-contained tests: a fake CLAUDE_CONFIG_DIR and a stub "real" claude. Never touches ~/.claude.
 #   tests/run.sh
 set -uo pipefail
+exec </dev/null   # nothing under test may wait for input
 [ -n "${TRACE:-}" ] && set -x
 
 root=$(cd -P "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
@@ -16,7 +17,7 @@ mkdir -p "$HOME/work/a_b" "$HOME/work/dest" "$CLAUDE_CONFIG_DIR"/{projects,sessi
 # Stub real claude: records calls; `agents --json --all` returns $t/agents.json
 cat > "$t/stub/claude" <<EOF
 #!/usr/bin/env bash
-echo "\$*" >> "$t/calls"
+echo "\$PWD :: \$*" >> "$t/calls"
 if [ "\$1 \$2" = "agents --json" ]; then cat "$t/agents.json" 2>/dev/null || echo '[]'; fi
 EOF
 chmod +x "$t/stub/claude"
@@ -52,7 +53,7 @@ make_session $C "$HOME/work/a_b" "bg review" "papaya"
 pdir=$CLAUDE_CONFIG_DIR/projects/$(enc "$HOME/work/a_b")
 
 # passthrough
-claude --version >/dev/null; check "passthrough reaches real claude" grep -qx -- "--version" "$t/calls"
+claude --version >/dev/null; check "passthrough reaches real claude" grep -q -- ":: --version\$" "$t/calls"
 check "claude shim reports" sh -c "claude shim | grep -q 'real claude: $t/stub/claude'"
 
 # search
@@ -99,12 +100,29 @@ else bad "rm deletes session files, keeps memory/"; fi
 # rm: background session goes through real claude rm first
 printf '[{"sessionId":"%s","kind":"background","name":"bg review"}]\n' $C > "$t/agents.json"
 claude rm -y "bg review" >/dev/null 2>&1
-if grep -qx "rm cccccccc" "$t/calls" && [ ! -e "$pdir/$C.jsonl" ]; then ok "rm background calls real rm"; else bad "rm background calls real rm" "$(cat "$t/calls")"; fi
+if grep -q ":: rm cccccccc\$" "$t/calls" && [ ! -e "$pdir/$C.jsonl" ]; then ok "rm background calls real rm"; else bad "rm background calls real rm" "$(cat "$t/calls")"; fi
 
 # mv: background refused
+# mv: background session is stopped, its job dropped, moved, and restarted in the new dir with its name and flags
 make_session $C "$HOME/work/a_b" "bg review" "papaya"
-out=$(claude mv cccccccc "$HOME/work/dest" 2>&1); check "mv refuses background session" grep -q "background session" <<<"$out"
+mkdir -p "$CLAUDE_CONFIG_DIR/jobs/cccccccc"
+printf '{"name":"bg review","respawnFlags":["--permission-mode","auto","-n","bg review"]}\n' > "$CLAUDE_CONFIG_DIR/jobs/cccccccc/state.json"
+: > "$t/calls"
+out=$(claude mv cccccccc "$HOME/work/dest" 2>&1)
+ddir=$CLAUDE_CONFIG_DIR/projects/$(enc "$HOME/work/dest")
+if grep -q ":: stop cccccccc\$" "$t/calls" && grep -q ":: rm cccccccc\$" "$t/calls" \
+   && grep -qx "$HOME/work/dest :: --bg --resume $C --permission-mode auto -n bg review" "$t/calls" \
+   && [ -e "$ddir/$C.jsonl" ] && [ ! -e "$pdir/$C.jsonl" ]; then ok "mv background: stop, rm job, move, restart in new dir"
+else bad "mv background: stop, rm job, move, restart in new dir" "$out
+$(cat "$t/calls")"; fi
 echo '[]' > "$t/agents.json"
+
+# mv --from: same session id stored in two dirs
+E=eeeeeeee-1111-2222-3333-444444444444
+make_session $E "$HOME/work/a_b" "dup" "x"; make_session $E "$HOME/work/a_b/sub" "dup" "x"
+out=$(claude mv -n $E "$HOME/work/dest" 2>&1); check "mv lists duplicate copies" grep -q -- "--from" <<<"$out"
+out=$(claude mv --from "$HOME/work/a_b/sub" $E "$HOME/work/dest" 2>&1)
+if [ -e "$ddir/$E.jsonl" ] && [ -e "$pdir/$E.jsonl" ]; then ok "mv --from picks one copy"; else bad "mv --from picks one copy" "$out"; fi
 
 # mv: moves jsonl + session dir to the encoded destination
 claude mv beta "$HOME/work/dest" >/dev/null 2>&1

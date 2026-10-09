@@ -5,7 +5,7 @@ A thin wrapper around the [Claude Code](https://claude.com/claude-code) CLI that
 | Command | What it does |
 |---|---|
 | `claude rm [-y] [-n] <session>` | Delete a session (regular or background) and everything stored for it. |
-| `claude mv [-n] <session> <dir>` | Move a session so it resumes from another directory. |
+| `claude mv [-n] [--from DIR] <session> <dir>` | Move a session so it resumes from another directory. Background sessions are stopped, moved and restarted there with the same id, name and flags. |
 | `claude ls [-r] [options] [DIR]` | List sessions started in DIR (default: current directory), newest first. `-r` includes subdirectories. |
 | `claude search [options] PATTERN...` | Search session transcripts by regex (`claude search -h`). |
 | `claude shim` | Show the shim version and which real `claude` it wraps. |
@@ -56,7 +56,8 @@ Claude Code keeps a session's data in several places under `~/.claude` (or `$CLA
 
 - `rm` shows the session (title, directory, last used, first prompt) and asks before deleting, unless `-y`.
 - `rm` refuses a session that's open in a terminal. Background sessions go through Claude Code's own `claude rm` first, which stops them and removes their worktree when safe, then the shim deletes the remaining files.
-- `mv` refuses running sessions and background sessions (Claude Code tracks background sessions by directory).
+- `mv` refuses a session that's open in a terminal. A background session is stopped, its daemon job dropped with Claude Code's own `claude rm` (which keeps the transcript), the files moved, and the session restarted with `claude --bg --resume` in the new directory, keeping its id, name and launch flags. A turn in progress is interrupted.
+- If the same session id is stored under two directories (from a copy or migration), `mv` lists both with their sizes; pick one with `--from <old dir>`, which works even after that directory is gone.
 - Nothing is ever deleted outside the session's own paths.
 
 ## Caveats
