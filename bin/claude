@@ -100,15 +100,19 @@ first_prompt() {
     | tr '\n\t' '  ' | cut -c1-100
 }
 
-# "<kind> <pid>" if the session has a live process, else empty.
+# "<kind> <pid>" if the session has a live process, else empty. A background session can also be open in a
+# terminal (claude --resume); that process is reported first, since stopping the background job doesn't end it.
 live() {
-  local sid=$1 f pid kind
+  local sid=$1 f pid kind bgp=""
   for f in "$CLAUDE_HOME"/sessions/*.json; do
     [ -e "$f" ] || continue
     [ "$(jq -r .sessionId "$f" 2>/dev/null)" = "$sid" ] || continue
     pid=$(jq -r .pid "$f"); kind=$(jq -r .kind "$f")
-    kill -0 "$pid" 2>/dev/null && { echo "$kind $pid"; return; }
+    kill -0 "$pid" 2>/dev/null || continue
+    [ "$kind" = bg ] || { echo "$kind $pid"; return; }
+    bgp="$kind $pid"
   done
+  [ -z "$bgp" ] || echo "$bgp"
 }
 
 # Name, then launch flags one per line (minus -n/--name, which we pass ourselves), from the daemon's job record.
@@ -174,7 +178,7 @@ cmd_rm() {
   f=$(resolve "$1"); sid=$(basename "$f" .jsonl)
   l=$(live "$sid")
   is_background "$sid" && bg=1
-  [ -n "$l" ] && [ $bg = 0 ] && die "session $sid is open (${l% *} pid ${l#* }); close it first"
+  [ -z "$l" ] || { [ $bg = 1 ] && [ "${l% *}" = bg ]; } || die "session $sid is open (${l% *} pid ${l#* }); close it first"
 
   echo "Delete:"; describe "$f"
   [ $bg = 1 ] && echo "  background session: claude's own rm runs first (stops it, removes its worktree when safe)"
@@ -245,7 +249,7 @@ cmd_mv_dir() {  # <old> <new>
   for f in "$CLAUDE_HOME"/sessions/*.json; do
     [ -e "$f" ] || continue
     IFS=$'\t' read -r sid i h < <(jq -r '[.sessionId, .pid, .kind] | @tsv' "$f" 2>/dev/null) || continue
-    kill -0 "$i" 2>/dev/null && alive[$sid]="$h $i"
+    [ "$h" != bg ] && kill -0 "$i" 2>/dev/null && alive[$sid]="$h $i"   # the daemon's own process is fine
   done
 
   # Project dirs for <old> and below share its encoded prefix, but so does a sibling like <old>-x.
@@ -273,11 +277,10 @@ cmd_mv_dir() {  # <old> <new>
       [ -n "$h" ] || [ -z "${tree[x$rest]+set}" ] || h=$old${tree[x$rest]}
       [ "$en" = "$eo" ] || { [ ! -e "$PROJECTS/$en$rest/$sid.jsonl" ] && [ ! -e "$PROJECTS/$en$rest/$sid" ]; } \
         || die "$PROJECTS/$en$rest already has files for $sid"
+      [ -z "${alive[$sid]:-}" ] || open+=("$sid (${alive[$sid]% *} pid ${alive[$sid]#* })")
       if [ -n "${bgset[$sid]:-}" ]; then
         [ -n "$h" ] || die "can't tell which dir under $old background session $sid runs in; move it on its own with claude mv first"
         bgs+=("${#sess[@]}")
-      elif [ -n "${alive[$sid]:-}" ]; then
-        open+=("$sid (${alive[$sid]% *} pid ${alive[$sid]#* })")
       fi
       sess+=("$f"); homes+=("$h"); dests+=("$PROJECTS/$en$rest")
     done
@@ -379,12 +382,12 @@ cmd_mv() {
   dest=$(cd "$2" 2>/dev/null && pwd) || die "no such directory: $2"
   is_background "$sid" && bg=1
   l=$(live "$sid")
-  [ -z "$l" ] || [ $bg = 1 ] || die "session $sid is open (${l% *} pid ${l#* }); close it first"
+  [ -z "$l" ] || { [ $bg = 1 ] && [ "${l% *}" = bg ]; } || die "session $sid is open (${l% *} pid ${l#* }); close it first"
   ddir=$PROJECTS/$(encode "$dest")
   [ "$ddir" != "$(dirname "$f")" ] || die "already in $dest"
   [ ! -e "$ddir/$sid.jsonl" ] && [ ! -e "$ddir/$sid" ] || die "$ddir already has files for $sid"
   if [ $bg = 1 ]; then
-    { IFS= read -r name; while IFS= read -r x; do flags+=("$x"); done; } < <(bg_job "$sid")
+    { IFS= read -r name || true; while IFS= read -r x; do flags+=("$x"); done; } < <(bg_job "$sid")
     [ -n "$name" ] || name=$(title_of "$f")
   fi
 

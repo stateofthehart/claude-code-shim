@@ -117,6 +117,24 @@ else bad "mv background: stop, rm job, move, restart in new dir" "$out
 $(cat "$t/calls")"; fi
 echo '[]' > "$t/agents.json"
 
+# mv / rm: a background session that is also open in a terminal is refused (stopping the job wouldn't end it)
+K=55555555-1111-2222-3333-444444444444
+make_session $K "$HOME/work/a_b" "bg open" "x"
+printf '[{"sessionId":"%s","kind":"background","name":"bg open"}]\n' $K > "$t/agents.json"
+sleep 300 & bgp=$!; sleep 300 & tp=$!
+printf '{"pid":%s,"sessionId":"%s","kind":"bg"}\n' $bgp $K > "$CLAUDE_CONFIG_DIR/sessions/$bgp.json"
+printf '{"pid":%s,"sessionId":"%s","kind":"interactive"}\n' $tp $K > "$CLAUDE_CONFIG_DIR/sessions/$tp.json"
+: > "$t/calls"
+out=$(claude mv 55555555 "$HOME/work/dest" 2>&1)
+if grep -q "is open (interactive pid $tp)" <<<"$out" && [ -e "$pdir/$K.jsonl" ] && ! grep -q ":: stop" "$t/calls"; then ok "mv refuses background session open in a terminal"
+else bad "mv refuses background session open in a terminal" "$out"; fi
+out=$(claude rm -y 55555555 2>&1)
+if grep -q "is open" <<<"$out" && [ -e "$pdir/$K.jsonl" ]; then ok "rm refuses background session open in a terminal"; else bad "rm refuses background session open in a terminal" "$out"; fi
+kill $tp 2>/dev/null; wait $tp 2>/dev/null; rm -f "$CLAUDE_CONFIG_DIR/sessions/$tp.json"
+out=$(claude mv -n 55555555 "$HOME/work/dest" 2>&1); check "mv still allows the daemon's own process" grep -q "dry run" <<<"$out"
+kill $bgp 2>/dev/null; wait $bgp 2>/dev/null; rm -f "$CLAUDE_CONFIG_DIR/sessions/$bgp.json"
+claude rm -y 55555555 >/dev/null 2>&1; echo '[]' > "$t/agents.json"
+
 # mv --from: same session id stored in two dirs
 E=eeeeeeee-1111-2222-3333-444444444444
 make_session $E "$HOME/work/a_b" "dup" "x"; make_session $E "$HOME/work/a_b/sub" "dup" "x"
@@ -156,6 +174,13 @@ sleep 300 & live_pid=$!
 printf '{"pid":%s,"sessionId":"%s","kind":"interactive"}\n' $live_pid $G > "$CLAUDE_CONFIG_DIR/sessions/$live_pid.json"
 out=$(claude mv -d "$W/proj" "$W/renamed" 2>&1)
 if grep -q "are open" <<<"$out" && [ -d "$W/proj" ]; then ok "mv -d refuses open sessions"; else bad "mv -d refuses open sessions" "$out"; fi
+kill $live_pid 2>/dev/null; wait $live_pid 2>/dev/null; rm -f "$CLAUDE_CONFIG_DIR/sessions/$live_pid.json"
+sleep 300 & live_pid=$!
+printf '{"pid":%s,"sessionId":"%s","kind":"interactive"}\n' $live_pid $I > "$CLAUDE_CONFIG_DIR/sessions/$live_pid.json"
+: > "$t/calls"
+out=$(claude mv -d "$W/proj" "$W/renamed" 2>&1)
+if grep -q "are open" <<<"$out" && grep -q 77777777 <<<"$out" && [ -d "$W/proj" ] && ! grep -q ":: stop" "$t/calls"; then ok "mv -d refuses background session open in a terminal"
+else bad "mv -d refuses background session open in a terminal" "$out"; fi
 kill $live_pid 2>/dev/null; wait $live_pid 2>/dev/null; rm -f "$CLAUDE_CONFIG_DIR/sessions/$live_pid.json"
 out=$(claude mv -d "$W/proj" "$W/dest" 2>&1); check "mv -d refuses existing target" grep -q "already exists" <<<"$out"
 
