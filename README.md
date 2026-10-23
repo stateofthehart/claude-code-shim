@@ -6,6 +6,7 @@ A thin wrapper around the [Claude Code](https://claude.com/claude-code) CLI that
 |---|---|
 | `claude rm [-y] [-n] <session>` | Delete a session (regular or background) and everything stored for it. |
 | `claude mv [-n] [--from DIR] <session> <dir>` | Move a session so it resumes from another directory. Background sessions are stopped, moved and restarted there with the same id, name and flags. |
+| `claude mv [-n] -d <old> <new>` | Rename or move a directory and bring every session started in it or below along. If you already moved the directory yourself, it just moves the sessions. |
 | `claude ls [-r] [options] [DIR]` | List sessions started in DIR (default: current directory), newest first. `-r` includes subdirectories. |
 | `claude search [options] PATTERN...` | Search session transcripts by regex (`claude search -h`). |
 | `claude shim` | Show the shim version and which real `claude` it wraps. |
@@ -42,13 +43,14 @@ The shim must come before the real `claude` on PATH, which is why the rc block g
 
 Claude Code keeps a session's data in several places under `~/.claude` (or `$CLAUDE_CONFIG_DIR`):
 
-| Path | Contents | `rm` | `mv` |
-|---|---|---|---|
-| `projects/<dir>/<id>.jsonl` | the transcript | deleted | moved |
-| `projects/<dir>/<id>/` | subagent transcripts, tool results, title | deleted | moved |
-| `file-history/<id>/` | file snapshots for undo | deleted | kept (global) |
-| `session-env/<id>/` | session environment | deleted | kept (global) |
-| `projects/<dir>/memory/` | auto-memory, **shared by every session in that directory** | kept | not carried over |
+| Path | Contents | `rm` | `mv` | `mv -d` |
+|---|---|---|---|---|
+| `projects/<dir>/<id>.jsonl` | the transcript | deleted | moved | moved, recorded cwds rewritten |
+| `projects/<dir>/<id>/` | subagent transcripts, tool results, title | deleted | moved | moved |
+| `file-history/<id>/` | file snapshots for undo | deleted | kept (global) | kept (global) |
+| `session-env/<id>/` | session environment | deleted | kept (global) | kept (global) |
+| `projects/<dir>/memory/` | auto-memory, **shared by every session in that directory** | kept | not carried over | moved (unless the new dir already has one) |
+| `~/.claude.json` `projects` entries | trust, allowed tools, MCP settings per directory | | | renamed |
 
 `<dir>` is the session's working directory with every non-alphanumeric character replaced by `-`.
 
@@ -58,11 +60,15 @@ Claude Code keeps a session's data in several places under `~/.claude` (or `$CLA
 - `rm` refuses a session that's open in a terminal. Background sessions go through Claude Code's own `claude rm` first, which stops them and removes their worktree when safe, then the shim deletes the remaining files.
 - `mv` refuses a session that's open in a terminal. A background session is stopped, its daemon job dropped with Claude Code's own `claude rm` (which keeps the transcript), the files moved, and the session restarted with `claude --bg --resume` in the new directory, keeping its id, name and launch flags. A turn in progress is interrupted.
 - If the same session id is stored under two directories (from a copy or migration), `mv` lists both with their sizes; pick one with `--from <old dir>`, which works even after that directory is gone.
+- `mv -d` refuses if any session under the directory is open in a terminal, or if the new path already exists. Background sessions under it are stopped and restarted in their new directory as with `mv`. After the move it runs `git worktree repair` on every git worktree under the new path, so linked worktrees and their main clone find each other again.
+- `mv -d` tells subdirectories from look-alike siblings (`proj/x` vs `proj-x`, which encode the same) by checking the directories on disk. It lists anything it can't place and leaves it alone.
 - Nothing is ever deleted outside the session's own paths.
 
 ## Caveats
 
 - This depends on Claude Code's on-disk layout, which isn't a public API and may change between versions. Run `tests/run.sh` after upgrading Claude Code if anything looks off.
+- `mv -d` rewrites `~/.claude.json` while other Claude Code sessions may be running; it replaces the file in one step, but a session that saves its config at the same moment could undo the rename for those entries.
+- `mv -d` doesn't touch `history.jsonl` (prompt history), so up-arrow history for the old path doesn't follow.
 - `mv` doesn't rewrite the working directory recorded inside the transcript. Resuming from the new directory works by session id; tools in the resumed session use the directory you resume from.
 
 ## Development

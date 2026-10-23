@@ -5,6 +5,8 @@
 #   claude mv [-n] [--from DIR] <session> <dir>
 #                                          move a session so it resumes from <dir>; background sessions are
 #                                          stopped, moved, and restarted in <dir> with the same id and name
+#   claude mv [-n] -d <old> <new>          rename/move directory <old> to <new> and every session started in it or
+#                                          below; if <old> was already moved by hand, just moves the sessions
 #   claude ls [-r] [options] [DIR]         list sessions started in DIR (default .), -r includes subdirs
 #   claude search [options] PATTERN...     search transcripts (claude search -h)
 #   claude shim                            show shim version and which real claude it wraps
@@ -123,13 +125,29 @@ is_background() {
 }
 
 # The directory a session resumes from: the recorded cwd whose encoding matches its project dir.
-home_dir() {
+# Fails if there is none (the session was moved here and hasn't run since).
+home_exact() {
   local f=$1 pdir c
   pdir=$(basename "$(dirname "$f")")
   while IFS= read -r c; do
     [ "$(encode "$c")" = "$pdir" ] && { echo "$c"; return; }
   done < <(grep -o '"cwd":"[^"]*"' "$f" | sed 's/^"cwd":"//;s/"$//' | awk '!seen[$0]++')
-  grep -m1 -o '"cwd":"[^"]*"' "$f" | sed 's/^"cwd":"//;s/"$//'
+  return 1
+}
+
+# home_exact, falling back to the first recorded cwd.
+home_dir() {
+  home_exact "$1" || grep -m1 -o '"cwd":"[^"]*"' "$1" | sed 's/^"cwd":"//;s/"$//'
+}
+
+# Absolute path without requiring it to exist (its parent should, to get a clean path).
+abspath() {
+  local p=${1%/} d
+  [ -n "$p" ] || p=/
+  [ -d "$p" ] && { (cd "$p" && pwd); return; }
+  case "$p" in /*) ;; *) p=$PWD/$p ;; esac
+  d=$(cd "$(dirname "$p")" 2>/dev/null && pwd) || { echo "$p"; return; }
+  echo "${d%/}/$(basename "$p")"
 }
 
 describe() {  # <transcript>
@@ -150,7 +168,7 @@ session_paths() {  # <transcript> -> every path belonging to the session that ex
 
 cmd_rm() {
   local yes=0 dry=0
-  while [ $# -gt 0 ]; do case "$1" in -y|--yes) yes=1 ;; -n|--dry-run) dry=1 ;; -h|--help) sed -n '2,19p' "$SHIM_DIR/claude"; exit 0 ;; *) break ;; esac; shift; done
+  while [ $# -gt 0 ]; do case "$1" in -y|--yes) yes=1 ;; -n|--dry-run) dry=1 ;; -h|--help) sed -n '2,21p' "$SHIM_DIR/claude"; exit 0 ;; *) break ;; esac; shift; done
   [ $# -eq 1 ] || die "usage: claude rm [-y] [-n] <session>"
   local f sid l bg=0
   f=$(resolve "$1"); sid=$(basename "$f" .jsonl)
@@ -172,13 +190,189 @@ cmd_rm() {
   echo "Deleted $sid"
 }
 
+# Point the transcript's recorded cwds under <old> at <new>, so it reads as started in the new location.
+rewrite_cwd() {  # <transcript> <old> <new>
+  local f=$1 o n
+  o=$(sed 's/[][\\.*^$#]/\\&/g' <<<"$2"); n=$(sed 's/[\\&#]/\\&/g' <<<"$3")
+  cp -p -- "$f" "$f.shim-tmp"
+  sed "s#\"cwd\":\"$o\([/\"]\)#\"cwd\":\"$n\1#g" "$f" > "$f.shim-tmp" && mv -f -- "$f.shim-tmp" "$f"
+}
+
+# Reconnect git worktrees under <new> after their directory moved there from <old>.
+repair_worktrees() {  # <old> <new>
+  local old=$1 new=$2 g d gd main
+  while IFS= read -r g; do
+    d=$(dirname "$g")
+    if [ -d "$g" ]; then   # a main worktree: this fixes its linked worktrees elsewhere
+      git -C "$d" worktree repair >/dev/null 2>&1 || true
+      continue
+    fi
+    gd=$(sed -n 's/^gitdir: //p' "$g")
+    case "$gd" in
+      "$old"/*/worktrees/*)   # its main worktree moved too: repair from there
+        main=$new${gd#"$old"}; main=${main%/worktrees/*}; [ "${main##*/}" = .git ] && main=${main%/.git}
+        set -- -C "$main" worktree repair "$d" ;;
+      /*/worktrees/*) set -- -C "$d" worktree repair ;;
+      *) continue ;;   # a submodule (relative gitdir): unaffected
+    esac
+    if git "$@" >/dev/null 2>&1; then echo "  repaired git worktree $d"
+    else echo "  warning: git worktree repair failed for $d" >&2; fi
+  done < <(find "$new" \( -name node_modules -o -name .venv \) -prune -o -name .git -print -prune 2>/dev/null)
+}
+
+# claude mv -d: move a directory and every session started in it or below.
+cmd_mv_dir() {  # <old> <new>
+  local old new moving eo en p f h sid rest in_tree n=0 cfg nkeys=0 i
+  local -a sess=() homes=() dests=() mems=() skipped=() open=() bgs=()
+  local -A bgset=() alive=() bginfo=() excluded=() tree=()
+  old=$(abspath "$1"); new=$(abspath "$2")
+  [ "$old" != / ] || die "refusing to move /"
+  [ "$old" != "$new" ] || die "$old and $new are the same"
+  case "$new/" in "$old"/*) die "can't move $old into itself" ;; esac
+  if [ -d "$old" ] && [ ! -e "$new" ]; then
+    [ -d "$(dirname "$new")" ] || die "no such directory: $(dirname "$new")"
+    moving=1
+  elif [ ! -e "$old" ] && [ -d "$new" ]; then
+    moving=0   # already moved by hand: just bring the sessions along
+  elif [ -d "$old" ]; then
+    die "$new already exists; give the full new path, e.g. $new/$(basename "$old")"
+  else
+    die "no such directory: $old"
+  fi
+
+  while IFS= read -r sid; do [ -n "$sid" ] && bgset[$sid]=1; done \
+    < <("$REAL" agents --json --all 2>/dev/null | jq -r '.[] | select(.kind == "background") | .sessionId' 2>/dev/null || true)
+  for f in "$CLAUDE_HOME"/sessions/*.json; do
+    [ -e "$f" ] || continue
+    IFS=$'\t' read -r sid i h < <(jq -r '[.sessionId, .pid, .kind] | @tsv' "$f" 2>/dev/null) || continue
+    kill -0 "$i" 2>/dev/null && alive[$sid]="$h $i"
+  done
+
+  # Project dirs for <old> and below share its encoded prefix, but so does a sibling like <old>-x.
+  # The directories on disk tell them apart, and for subdirs that are gone, the sessions' recorded cwds.
+  eo=$(encode "$old"); en=$(encode "$new")
+  [ $moving = 1 ] && rest=$old || rest=$new
+  while IFS=$'\t' read -r p h; do tree[x$p]=$h; done < <(
+    find "$rest" \( -name .git -o -name node_modules -o -name .venv \) -prune -o -type d -print 2>/dev/null \
+      | awk -v r="$rest" '{ s = substr($0, length(r) + 1); e = s; gsub(/[^A-Za-z0-9]/, "-", e); print e "\t" s }')
+  shopt -s nullglob
+  for p in "$PROJECTS/$eo" "$PROJECTS/$eo"-*; do
+    [ -d "$p" ] || continue
+    rest=${p#"$PROJECTS/$eo"}
+    in_tree=""; [ -n "${tree[x$rest]+set}" ] && in_tree=1
+    for f in "$p"/*.jsonl; do
+      h=$(home_exact "$f") || continue
+      case "$h" in "$old"|"$old"/*) in_tree=1 ;; *) excluded[$p]=1; [ -n "$in_tree" ] || in_tree=0 ;; esac
+    done
+    [ "$in_tree" = 0 ] && continue
+    if [ -z "$in_tree" ]; then skipped+=("$p"); continue; fi
+    for f in "$p"/*.jsonl; do
+      sid=$(basename "$f" .jsonl)
+      h=$(home_exact "$f") || h=""
+      case "$h" in ""|"$old"|"$old"/*) ;; *) continue ;; esac
+      [ -n "$h" ] || [ -z "${tree[x$rest]+set}" ] || h=$old${tree[x$rest]}
+      [ "$en" = "$eo" ] || { [ ! -e "$PROJECTS/$en$rest/$sid.jsonl" ] && [ ! -e "$PROJECTS/$en$rest/$sid" ]; } \
+        || die "$PROJECTS/$en$rest already has files for $sid"
+      if [ -n "${bgset[$sid]:-}" ]; then
+        [ -n "$h" ] || die "can't tell which dir under $old background session $sid runs in; move it on its own with claude mv first"
+        bgs+=("${#sess[@]}")
+      elif [ -n "${alive[$sid]:-}" ]; then
+        open+=("$sid (${alive[$sid]% *} pid ${alive[$sid]#* })")
+      fi
+      sess+=("$f"); homes+=("$h"); dests+=("$PROJECTS/$en$rest")
+    done
+    [ -d "$p/memory" ] && [ -z "${excluded[$p]:-}" ] && mems+=("$p")
+  done
+  shopt -u nullglob
+  [ ${#open[@]} -eq 0 ] || die "sessions under $old are open; close them first: $(printf '\n  %s' "${open[@]}")"
+
+  cfg=${CLAUDE_CONFIG_DIR:-$HOME}/.claude.json
+  [ -f "$cfg" ] && nkeys=$(jq --arg o "$old" '[.projects // {} | keys[] | select(. == $o or startswith($o + "/"))] | length' "$cfg" 2>/dev/null || echo 0)
+
+  if [ $moving = 1 ]; then echo "Move $old -> $new"; else echo "$old was already moved to $new; moving its sessions"; fi
+  [ ${#sess[@]} -gt 0 ] || echo "  no sessions under $old"
+  for i in "${!sess[@]}"; do
+    f=${sess[$i]}; h=${homes[$i]}
+    echo "  $(basename "$f" .jsonl)  \"$(title_of "$f")\"  ${h:-(dir unknown)}$([ -n "${bgset[$(basename "$f" .jsonl)]:-}" ] && echo '  [background]')"
+  done
+  if [ "$en" = "$eo" ]; then
+    mems=()
+    echo "  session files stay in projects/$eo* (both paths encode the same)"
+  elif [ ${#sess[@]} -gt 0 ]; then
+    echo "  session files: projects/$eo* -> projects/$en*"
+  fi
+  for p in "${mems[@]}"; do
+    if [ -e "$PROJECTS/$en${p#"$PROJECTS/$eo"}/memory" ]; then echo "  memory: $p/memory stays (destination already has one)"
+    else echo "  memory: $p/memory moves too"; fi
+  done
+  [ ${#bgs[@]} -gt 0 ] && echo "  background sessions are stopped, their jobs dropped (claude rm keeps transcripts), and restarted in the new dir"
+  [ "$nkeys" -gt 0 ] && echo "  $cfg: $nkeys project entries (trust, allowed tools, MCP) renamed"
+  echo "  recorded cwds in moved transcripts are rewritten to the new path; git worktrees under it are repaired"
+  for p in "${skipped[@]}"; do echo "  skipped $p: can't tell if it's under $old (no such dir there now, and no session ran there)"; done
+  [ $dry = 1 ] && { echo "(dry run, nothing moved)"; return; }
+
+  for i in "${bgs[@]}"; do
+    sid=$(basename "${sess[$i]}" .jsonl)
+    bginfo[$sid]=$(bg_job "$sid")
+    "$REAL" stop "${sid:0:8}" >/dev/null 2>&1 || true
+    "$REAL" rm "${sid:0:8}" >/dev/null || die "claude rm ${sid:0:8} failed; nothing moved"
+    [ -e "${sess[$i]}" ] || die "claude rm removed the transcript of $sid; nothing moved"
+  done
+
+  if [ $moving = 1 ]; then
+    mv -- "$old" "$new" || die "moving $old failed; sessions not moved"
+  fi
+  for i in "${!sess[@]}"; do
+    f=${sess[$i]}
+    rewrite_cwd "$f" "$old" "$new"
+    n=$((n+1))
+    [ "$en" != "$eo" ] || continue
+    mkdir -p "${dests[$i]}"
+    mv -- "$f" "${dests[$i]}/"
+    [ -d "${f%.jsonl}" ] && mv -- "${f%.jsonl}" "${dests[$i]}/"
+  done
+  for p in "${mems[@]}"; do
+    i=$PROJECTS/$en${p#"$PROJECTS/$eo"}
+    [ -e "$i/memory" ] || { mkdir -p "$i"; mv -- "$p/memory" "$i/"; }
+  done
+  for p in "$PROJECTS/$eo" "$PROJECTS/$eo"-*; do rmdir "$p" 2>/dev/null || true; done
+
+  if [ "$nkeys" -gt 0 ]; then
+    cp -p -- "$cfg" "$cfg.shim-tmp"
+    jq --arg o "$old" --arg n "$new" '.projects |= with_entries(
+        if .key == $o or (.key | startswith($o + "/")) then .key = $n + .key[($o | length):] else . end)' \
+      "$cfg" > "$cfg.shim-tmp" && mv -f -- "$cfg.shim-tmp" "$cfg" \
+      || { rm -f -- "$cfg.shim-tmp"; echo "  warning: couldn't update $cfg" >&2; }
+  fi
+  repair_worktrees "$old" "$new"
+
+  local name dir; local -a lines flags
+  for i in "${bgs[@]}"; do
+    sid=$(basename "${sess[$i]}" .jsonl); dir=$new${homes[$i]#"$old"}
+    mapfile -t lines <<<"${bginfo[$sid]}"
+    name=${lines[0]}; flags=("${lines[@]:1}")
+    [ -n "$name" ] || name=$(title_of "${dests[$i]}/$sid.jsonl")
+    if (cd "$dir" && "$REAL" --bg --resume "$sid" "${flags[@]}" -n "$name" >/dev/null); then
+      echo "  restarted \"$name\" in $dir (claude attach ${sid:0:8})"
+    else
+      echo "  warning: restarting failed; run: cd $dir && claude --bg --resume $sid -n \"$name\"" >&2
+    fi
+  done
+  if [ $moving = 1 ]; then echo "Moved $old to $new with $n session(s)."; else echo "Moved $n session(s) to $new."; fi
+}
+
 cmd_mv() {
-  local dry=0
+  local dry=0 dir=0
   while [ $# -gt 0 ]; do case "$1" in
     -n|--dry-run) dry=1 ;;
+    -d|--dir) dir=1 ;;
     --from) FROM=${2%/}; case "$FROM" in /*) ;; *) FROM=$PWD/$FROM ;; esac; shift ;;   # may no longer exist
-    -h|--help) sed -n '2,19p' "$SHIM_DIR/claude"; exit 0 ;;
+    -h|--help) sed -n '2,21p' "$SHIM_DIR/claude"; exit 0 ;;
     *) break ;; esac; shift; done
+  if [ $dir = 1 ]; then
+    [ $# -eq 2 ] || die "usage: claude mv [-n] -d <old dir> <new dir>"
+    cmd_mv_dir "$1" "$2"; return
+  fi
   [ $# -eq 2 ] || die "usage: claude mv [-n] [--from DIR] <session> <dir>"
   local f sid dest ddir bg=0 l name=""; local -a flags=()
   f=$(resolve "$1"); sid=$(basename "$f" .jsonl)

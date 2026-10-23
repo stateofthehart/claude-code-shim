@@ -131,6 +131,70 @@ if [ -e "$ddir/$B.jsonl" ] && [ -e "$ddir/$B/subagents/agent-x.jsonl" ] && [ ! -
 else bad "mv moves transcript and session dir"; fi
 out=$(claude mv beta /definitely/not/here 2>&1); check "mv rejects missing dir" grep -q "no such directory" <<<"$out"
 
+# mv -d: move a directory with its sessions (nested, background, memory), leaving a look-alike sibling alone
+W=$HOME/work
+mkdir -p "$W/proj/sub-dir" "$W/proj-x"
+git -C "$W/proj" init -q main && git -C "$W/proj/main" -c user.name=t -c user.email=t@t commit -q --allow-empty -m x \
+  && git -C "$W/proj/main" worktree add -q "$W/proj/wt" -b b1
+F=ffffffff-1111-2222-3333-444444444444; G=99999999-1111-2222-3333-444444444444
+H=88888888-1111-2222-3333-444444444444; I=77777777-1111-2222-3333-444444444444
+make_session $F "$W/proj" "top" "x"; make_session $G "$W/proj/sub-dir" "nested" "x"
+make_session $H "$W/proj-x" "sibling" "x"; make_session $I "$W/proj/sub-dir" "bg nested" "x"
+echo note > "$CLAUDE_CONFIG_DIR/projects/$(enc "$W/proj")/memory/m.md"
+mkdir -p "$CLAUDE_CONFIG_DIR/jobs/77777777"
+printf '{"name":"bg nested","respawnFlags":["--permission-mode","auto"]}\n' > "$CLAUDE_CONFIG_DIR/jobs/77777777/state.json"
+printf '[{"sessionId":"%s","kind":"background","name":"bg nested"}]\n' $I > "$t/agents.json"
+jq -n --arg a "$W/proj" --arg b "$W/proj/sub-dir" --arg c "$W/proj-x" \
+  '{projects: {($a): {hasTrustDialogAccepted: true}, ($b): {}, ($c): {}}}' > "$CLAUDE_CONFIG_DIR/.claude.json"
+pp() { echo "$CLAUDE_CONFIG_DIR/projects/$(enc "$1")"; }
+
+out=$(claude mv -n -d "$W/proj" "$W/renamed" 2>&1)
+if grep -q "dry run" <<<"$out" && [ -d "$W/proj" ] && [ -e "$(pp "$W/proj")/$F.jsonl" ] && ! grep -q $H <<<"$out"; then ok "mv -d -n changes nothing, skips sibling"
+else bad "mv -d -n changes nothing, skips sibling" "$out"; fi
+
+sleep 300 & live_pid=$!
+printf '{"pid":%s,"sessionId":"%s","kind":"interactive"}\n' $live_pid $G > "$CLAUDE_CONFIG_DIR/sessions/$live_pid.json"
+out=$(claude mv -d "$W/proj" "$W/renamed" 2>&1)
+if grep -q "are open" <<<"$out" && [ -d "$W/proj" ]; then ok "mv -d refuses open sessions"; else bad "mv -d refuses open sessions" "$out"; fi
+kill $live_pid 2>/dev/null; wait $live_pid 2>/dev/null; rm -f "$CLAUDE_CONFIG_DIR/sessions/$live_pid.json"
+out=$(claude mv -d "$W/proj" "$W/dest" 2>&1); check "mv -d refuses existing target" grep -q "already exists" <<<"$out"
+
+: > "$t/calls"
+out=$(cd "$W" && claude mv -d proj renamed 2>&1)
+R=$W/renamed
+if [ -d "$R/sub-dir" ] && [ ! -e "$W/proj" ] && [ -e "$(pp "$R")/$F.jsonl" ] && [ -e "$(pp "$R/sub-dir")/$G/subagents/agent-x.jsonl" ] \
+   && [ ! -e "$(pp "$W/proj")" ] && [ ! -e "$(pp "$W/proj/sub-dir")" ]; then ok "mv -d moves dir and nested sessions"
+else bad "mv -d moves dir and nested sessions" "$out"; fi
+if [ -e "$(pp "$W/proj-x")/$H.jsonl" ]; then ok "mv -d leaves look-alike sibling"; else bad "mv -d leaves look-alike sibling" "$out"; fi
+if [ "$(cat "$(pp "$R")/memory/m.md" 2>/dev/null)" = note ]; then ok "mv -d carries memory/"; else bad "mv -d carries memory/" "$out"; fi
+if grep -q "\"cwd\":\"$R/sub-dir\"" "$(pp "$R/sub-dir")/$G.jsonl" && ! grep -q "\"cwd\":\"$W/proj/" "$(pp "$R/sub-dir")/$G.jsonl"; then ok "mv -d rewrites recorded cwd"
+else bad "mv -d rewrites recorded cwd"; fi
+keys=$(jq -r '.projects | keys | join(" ")' "$CLAUDE_CONFIG_DIR/.claude.json")
+if [ "$keys" = "$W/proj-x $R $R/sub-dir" ] && jq -e --arg r "$R" '.projects[$r].hasTrustDialogAccepted' "$CLAUDE_CONFIG_DIR/.claude.json" >/dev/null
+then ok "mv -d renames .claude.json project entries"; else bad "mv -d renames .claude.json project entries" "$keys"; fi
+if [ "$(git -C "$R/wt" rev-parse --abbrev-ref HEAD 2>&1)" = b1 ] && git -C "$R/main" worktree list | grep -q "^$R/wt "; then ok "mv -d repairs git worktrees"
+else bad "mv -d repairs git worktrees" "$out
+$(git -C "$R/main" worktree list 2>&1)"; fi
+if grep -q ":: rm 77777777\$" "$t/calls" && grep -qx "$R/sub-dir :: --bg --resume $I --permission-mode auto -n bg nested" "$t/calls"
+then ok "mv -d restarts background session in new dir"; else bad "mv -d restarts background session in new dir" "$out
+$(cat "$t/calls")"; fi
+echo '[]' > "$t/agents.json"
+
+mv "$R" "$W/by-hand"
+out=$(claude mv -d "$R" "$W/by-hand" 2>&1)
+if [ -e "$(pp "$W/by-hand/sub-dir")/$G.jsonl" ] && [ -e "$(pp "$W/by-hand")/$F.jsonl" ] && [ ! -e "$(pp "$R")" ]; then ok "mv -d after moving by hand"
+else bad "mv -d after moving by hand" "$out"; fi
+
+# mv -d: a rename that encodes the same leaves the files in place; a session moved in earlier (cwd elsewhere) still goes
+J=66666666-1111-2222-3333-444444444444
+make_session $J "$W/elsewhere" "moved in" "x"; claude mv $J "$W/by-hand/sub-dir" >/dev/null 2>&1
+out=$(claude mv -d "$W/by-hand" "$W/by_hand" 2>&1)
+if [ -d "$W/by_hand/sub-dir" ] && [ -e "$(pp "$W/by_hand/sub-dir")/$G.jsonl" ] && grep -q "\"cwd\":\"$W/by_hand/sub-dir\"" "$(pp "$W/by_hand/sub-dir")/$G.jsonl"
+then ok "mv -d same-encoding rename"; else bad "mv -d same-encoding rename" "$out"; fi
+out=$(claude mv -d "$W/by_hand" "$W/final" 2>&1)
+if [ -e "$(pp "$W/final/sub-dir")/$J.jsonl" ] && grep -q "\"cwd\":\"$W/elsewhere\"" "$(pp "$W/final/sub-dir")/$J.jsonl"; then ok "mv -d takes sessions moved in earlier"
+else bad "mv -d takes sessions moved in earlier" "$out"; fi
+
 # installer: copy into a temp prefix with --no-rc, then uninstall
 out=$("$root/install.sh" --prefix "$t/prefix" --no-rc 2>&1)
 if [ -x "$t/prefix/bin/claude" ] && [ -f "$t/prefix/libexec/portable.sh" ]; then ok "install --prefix --no-rc"; else bad "install --prefix --no-rc" "$out"; fi
